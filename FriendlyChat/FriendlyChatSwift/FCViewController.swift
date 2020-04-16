@@ -16,7 +16,7 @@
 
 import UIKit
 import Firebase
-import FirebaseAuthUI
+import FirebaseUI
 
 // MARK: - FCViewController
 
@@ -53,8 +53,8 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     // MARK: Life Cycle
     
     override func viewDidLoad() {
-        self.signedInStatus(isSignedIn: true)
-        
+        // self.signedInStatus(isSignedIn: true)
+        configureAuth()
         // TODO: Handle what users see when view loads
     }
     
@@ -67,28 +67,76 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     
     func configureAuth() {
         // TODO: configure firebase authentication
+        let provider: [FUIAuthProvider] = [FUIGoogleAuth(), FUIEmailAuth()]
+        FUIAuth.defaultAuthUI()?.providers = provider
+        _authHandle = Auth.auth().addStateDidChangeListener{ (auth: Auth, user: User?) in
+            self.messages.removeAll(keepingCapacity: false)
+            self.messagesTable.reloadData()
+            
+            if let activeUser = user{
+                if self.user != activeUser{
+                    self.user = activeUser
+                    self.signedInStatus(isSignedIn: true)
+                    let name = user!.email?.components(separatedBy: "@")[0]
+                    self.displayName = name!
+                }else{
+                    self.signedInStatus(isSignedIn: false)
+                    self.loginSession()
+                }
+            }
+        }
     }
     
     func configureDatabase() {
         // TODO: configure database to sync messages
+        ref = FirebaseDatabase.Database.database().reference()
+        _refHandle = ref.child("messages").observe(.childAdded, with: {(snapshot) in
+            self.messages.append(snapshot)
+            self.messagesTable.insertRows(at: [IndexPath(row: self.messages.count - 1, section: 0)], with: .automatic)
+            self.scrollToBottomMessage()
+        })
     }
     
     func configureStorage() {
         // TODO: configure storage using your firebase storage
+        storageRef = FirebaseStorage.Storage.storage().reference()
     }
     
     deinit {
         // TODO: set up what needs to be deinitialized when view is no longer being used
+        ref.child("messages").removeObserver(withHandle: _refHandle)
+        Auth.auth().removeStateDidChangeListener(_authHandle)
     }
     
     // MARK: Remote Config
     
     func configureRemoteConfig() {
         // TODO: configure remote configuration settings
+        let remoteConfigSettings = RemoteConfigSettings()
+        remoteConfig = RemoteConfig.remoteConfig()
+        remoteConfig.configSettings = remoteConfigSettings
     }
     
     func fetchConfig() {
         // TODO: update to the current coniguratation
+        var expirationDuration: Double = 3600
+        if remoteConfig.configSettings.isDeveloperModeEnabled{
+            expirationDuration = 0
+        }
+        remoteConfig.fetch(withExpirationDuration: expirationDuration, completionHandler: {(status, error) in
+            if status == .success{
+                print("config fetched")
+                self.remoteConfig.activate(completionHandler: nil)
+                let friendlyMsgLength = self.remoteConfig["friendly_msg_length"]
+                if friendlyMsgLength.source != .static{
+                    self.msglength = friendlyMsgLength.numberValue!
+                    print("friend msg length config: \(self.msglength)")
+                }
+            }else{
+                print("config not fetched")
+                print("error : \(error!)")
+            }
+        })
     }
     
     // MARK: Sign In and Out
@@ -110,6 +158,10 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
             messageTextField.delegate = self
             
             // TODO: Set up app to send and receive messages when signed in
+            configureDatabase()
+            configureStorage()
+            configureRemoteConfig()
+            fetchConfig()
         }
     }
     
@@ -122,10 +174,24 @@ class FCViewController: UIViewController, UINavigationControllerDelegate {
     
     func sendMessage(data: [String:String]) {
         // TODO: create method that pushes message to the firebase database
+        // like specifying "/messages/[some_auto_id]"
+        var mdata = data
+        mdata[Constants.MessageFields.name] = displayName
+        ref.child("messages").childByAutoId().setValue(mdata)
     }
     
     func sendPhotoMessage(photoData: Data) {
         // TODO: create method that pushes message w/ photo to the firebase database
+        let imagePath = "chat_photos/" + Auth.auth().currentUser!.uid + "/\(Double(Date.timeIntervalSinceReferenceDate * 1000)).jpg"
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        storageRef.child(imagePath).putData(photoData, metadata: metadata){ (metadata, error) in
+            if let error = error{
+                print("error uploading: \(error)")
+                return
+            }
+            self.sendMessage(data: [Constants.MessageFields.imageUrl: self.storageRef.child((metadata?.path)!).description])
+        }
     }
     
     // MARK: Alert
@@ -201,8 +267,33 @@ extension FCViewController: UITableViewDelegate, UITableViewDataSource {
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         // dequeue cell
         let cell: UITableViewCell! = messagesTable.dequeueReusableCell(withIdentifier: "messageCell", for: indexPath)
-        return cell!
         // TODO: update cell to display message data
+        let messageSnapshot: DataSnapshot! = messages[indexPath.row]
+        let message = messageSnapshot.value as! [String:String]
+        let name = message[Constants.MessageFields.name] ?? "[username]"
+        if let imageUrl = message[Constants.MessageFields.imageUrl]{
+            cell.textLabel?.text = "sent by: \(name)"
+            Storage.storage().reference(forURL: imageUrl).getData(maxSize: INT64_MAX){
+                (data, error) in
+                guard error == nil else{
+                    print("error downloading: \(String(describing: error))")
+                    return
+                }
+                let messageImage = UIImage.init(data: data!, scale: 50)
+                if cell == tableView.cellForRow(at: indexPath){
+                    DispatchQueue.main.async {
+                        cell.imageView?.image = messageImage
+                        cell.setNeedsLayout()
+                    }
+                }
+            }
+        }else{
+            let text = message[Constants.MessageFields.text] ?? "[message]"
+            cell.textLabel?.text = name + ": " + text
+            cell.imageView?.image = self.placeholderImage
+        }
+        
+        return cell!
     }
     
     func tableView(_ tableView: UITableView, estimatedHeightForRowAt indexPath: IndexPath) -> CGFloat {
@@ -211,6 +302,22 @@ extension FCViewController: UITableViewDelegate, UITableViewDataSource {
     
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
             // TODO: if message contains an image, then display the image
+        guard !messageTextField.isFirstResponder else {return}
+        let messageSnapshot: DataSnapshot! = messages[(indexPath.row)]
+        let message = messageSnapshot.value as! [String: String]
+        if let imageUrl = message[Constants.MessageFields.imageUrl]{
+            if let cachedImage = imageCache.object(forKey: imageUrl as NSString){
+                showImageDisplay(image: cachedImage)
+            }else{
+                Storage.storage().reference(forURL: imageUrl).getData(maxSize: INT64_MAX, completion: {(data, error) in
+                    guard error == nil else{
+                        print("Error downloading: \(error!)")
+                        return
+                    }
+                    self.showImageDisplay(image: UIImage.init(data: data!)!)
+                })
+            }
+        }
     }
     
     // MARK: Show Image Display
@@ -280,25 +387,25 @@ extension FCViewController: UITextFieldDelegate {
     
     // MARK: Show/Hide Keyboard
     
-    func keyboardWillShow(_ notification: Notification) {
+    @objc func keyboardWillShow(_ notification: Notification) {
         if !keyboardOnScreen {
             self.view.frame.origin.y -= self.keyboardHeight(notification)
         }
     }
     
-    func keyboardWillHide(_ notification: Notification) {
+    @objc func keyboardWillHide(_ notification: Notification) {
         if keyboardOnScreen {
             self.view.frame.origin.y += self.keyboardHeight(notification)
         }
     }
     
-    func keyboardDidShow(_ notification: Notification) {
+    @objc func keyboardDidShow(_ notification: Notification) {
         keyboardOnScreen = true
         dismissKeyboardRecognizer.isEnabled = true
         scrollToBottomMessage()
     }
     
-    func keyboardDidHide(_ notification: Notification) {
+    @objc func keyboardDidHide(_ notification: Notification) {
         dismissKeyboardRecognizer.isEnabled = false
         keyboardOnScreen = false
     }
